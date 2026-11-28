@@ -37,9 +37,10 @@ def check_tokens():
     }
     missing_tokens = [name for name, value in tokens.items() if not value]
     if missing_tokens:
+        missing_tokens_str = ', '.join(missing_tokens)
         logging.critical(
             f'Отсутствуют обязательные переменные окружения: '
-            f'{", ".join(missing_tokens)}'
+            f'{missing_tokens_str}'
         )
         return False
     return True
@@ -54,9 +55,11 @@ def send_message(vk, message):
             message=message,
             random_id=get_random_id()
         )
-        logging.info(f'Бот отправил сообщение: "{message}"')
-    except Exception as error:
-        logging.error(f'Сбой при отправке сообщения в VK: {error}')
+    except (vk_api.ApiError, requests.RequestException) as error:
+        logging.exception(f'Сбой при отправке сообщения в VK: {error}')
+        return False
+    logging.info(f'Бот отправил сообщение: "{message}"')
+    return True
 
 
 def get_api_answer(timestamp):
@@ -69,12 +72,17 @@ def get_api_answer(timestamp):
         response = requests.get(ENDPOINT, headers=HEADERS, params=payload)
     except requests.RequestException as error:
         raise ConnectionError(
-            f'Ошибка при запросе к API ({ENDPOINT}): {error}'
-        )
+            f'Ошибка при запросе к API {ENDPOINT} '
+            f'с параметрами {payload}: {error}'
+        ) from error
     if response.status_code != HTTPStatus.OK:
+        status_code = response.status_code
+        response_text = response.text
         raise ConnectionError(
             f'Эндпоинт {ENDPOINT} недоступен. '
-            f'Код ответа API: {response.status_code}'
+            f'Параметры запроса: {payload}. '
+            f'Код ответа: {status_code}. '
+            f'Текст ответа: {response_text}'
         )
     return response.json()
 
@@ -83,14 +91,21 @@ def check_response(response):
     """Проверка ответа API на соответствие документации."""
     logging.debug('Начинаем проверку ответа API.')
     if not isinstance(response, dict):
-        raise TypeError('Ответ API не является словарём.')
+        response_type = type(response)
+        raise TypeError(
+            f'Ответ API не является словарём. Получен тип: {response_type}'
+        )
     if 'homeworks' not in response:
         raise KeyError('В ответе API отсутствует ключ "homeworks".')
     if 'current_date' not in response:
         raise KeyError('В ответе API отсутствует ключ "current_date".')
     homeworks = response['homeworks']
     if not isinstance(homeworks, list):
-        raise TypeError('Значение ключа "homeworks" не является списком.')
+        homeworks_type = type(homeworks)
+        raise TypeError(
+            f'Значение ключа "homeworks" не является списком. '
+            f'Получен тип: {homeworks_type}'
+        )
     return homeworks
 
 
@@ -124,16 +139,17 @@ def main():
             homeworks = check_response(response)
             if homeworks:
                 message = parse_status(homeworks[0])
-                send_message(vk, message)
+                if send_message(vk, message):
+                    timestamp = response.get('current_date', timestamp)
+                    last_error_message = ''
             else:
                 logging.debug('Новых статусов в ответе API нет.')
-            timestamp = response.get('current_date', timestamp)
-            last_error_message = ''
+                timestamp = response.get('current_date', timestamp)
+                last_error_message = ''
         except Exception as error:
             message = f'Сбой в работе программы: {error}'
-            logging.error(message, exc_info=True)
-            if message != last_error_message:
-                send_message(vk, message)
+            logging.exception(message)
+            if message != last_error_message and send_message(vk, message):
                 last_error_message = message
         finally:
             time.sleep(RETRY_PERIOD)
@@ -143,6 +159,6 @@ if __name__ == '__main__':
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[logging.StreamHandler(sys.stdout)]
+        handlers=(logging.StreamHandler(sys.stdout),),
     )
     main()
